@@ -1,0 +1,136 @@
+name: kafka-cluster
+
+# Cụm 3 broker, KRaft combined mode (mỗi node vừa là broker vừa là controller), image apache/kafka:4.3.1.
+# Mỗi node có 3 listener:
+#   INTERNAL    kafka-N:19092   broker <-> broker và container <-> broker (địa chỉ quảng bá = tên service)
+#   EXTERNAL    127.0.0.1:<cổng>  cho host (kafka-1: 19094, kafka-2: 19095, kafka-3: 19096)
+#   CONTROLLER  kafka-N:9093    quorum KRaft
+# Vì sao cần INTERNAL riêng: broker nhân bản dữ liệu qua listener inter-broker. Nếu chỉ có listener quảng bá
+# `localhost:<cổng>`, broker sẽ tự nối vào chính container của nó và ISR tụt dần về 1.
+
+x-kafka: &kafka
+  image: apache/kafka:4.3.1
+  networks: [kafka-net]
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 10s
+    retries: 12
+    start_period: 15s
+
+x-kafka-env: &kafka-env
+  # Cả 3 node PHẢI dùng chung CLUSTER_ID (chuỗi base64 22 ký tự, tạo bằng kafka-storage.sh random-uuid).
+  CLUSTER_ID: ${CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+services:
+  kafka-1:
+    <<: *kafka
+    hostname: kafka-1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:19092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT_1:-19094}
+    ports:
+      - "127.0.0.1:${KAFKA_EXTERNAL_PORT_1:-19094}:9094"
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+
+  kafka-2:
+    <<: *kafka
+    hostname: kafka-2
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:19092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT_2:-19095}
+    ports:
+      - "127.0.0.1:${KAFKA_EXTERNAL_PORT_2:-19095}:9094"
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+
+  kafka-3:
+    <<: *kafka
+    hostname: kafka-3
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:19092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT_3:-19096}
+    ports:
+      - "127.0.0.1:${KAFKA_EXTERNAL_PORT_3:-19096}:9094"
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+
+  # One-shot: topic `orders` 3 partition, RF 3, min.insync.replicas=2 (chờ cả 3 broker healthy).
+  init:
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka-1: {condition: service_healthy}
+      kafka-2: {condition: service_healthy}
+      kafka-3: {condition: service_healthy}
+    networks: [kafka-net]
+    command:
+      - /opt/kafka/bin/kafka-topics.sh
+      - --bootstrap-server
+      - kafka-1:19092,kafka-2:19092,kafka-3:19092
+      - --create
+      - --if-not-exists
+      - --topic
+      - orders
+      - --partitions
+      - "3"
+      - --replication-factor
+      - "3"
+      - --config
+      - min.insync.replicas=2
+    restart: "no"
+
+  # Ứng dụng Python (acks=all): docker compose -f compose.cluster.yaml run --rm producer / consumer
+  producer:
+    profiles: [app]
+    build: ./app
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:19092,kafka-2:19092,kafka-3:19092
+      TOPIC: orders
+      MESSAGES: ${MESSAGES:-12}
+      MESSAGE_TIMEOUT_MS: ${MESSAGE_TIMEOUT_MS:-}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks: [kafka-net]
+    command: ["python", "producer.py"]
+
+  consumer:
+    profiles: [app]
+    build: ./app
+    environment:
+      BOOTSTRAP_SERVERS: kafka-1:19092,kafka-2:19092,kafka-3:19092
+      TOPIC: orders
+      GROUP_ID: ${GROUP_ID:-orders-consumer}
+      IDLE_EXIT_SECONDS: ${IDLE_EXIT_SECONDS:-0}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks: [kafka-net]
+    command: ["python", "consumer.py"]
+
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+
+networks:
+  kafka-net:
