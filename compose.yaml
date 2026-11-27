@@ -1,0 +1,97 @@
+name: kafka-lab
+
+# Kafka single-node, KRaft combined mode (broker + controller trong 1 process), 2 listener:
+#   INTERNAL  kafka:9092      cho container trong network `kafka-net`
+#   EXTERNAL  127.0.0.1:9094  cho ứng dụng chạy trên máy host
+# Lưu ý: image apache/kafka chỉ dùng cấu hình mặc định khi KHÔNG có biến KAFKA_* nào.
+# Đã đặt bất kỳ KAFKA_* nào thì phải khai báo ĐỦ bộ dưới đây.
+x-kafka-image: &kafka-image apache/kafka:4.3.1
+
+services:
+  kafka:
+    image: *kafka-image
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      # Quảng bá địa chỉ MÀ CLIENT SẼ DÙNG: container thấy kafka:9092, host thấy localhost:<cổng publish>.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    ports:
+      # 127.0.0.1: broker không có xác thực, chỉ mở cho máy này.
+      # Cổng host PHẢI trùng cổng trong KAFKA_ADVERTISED_LISTENERS (cùng biến KAFKA_EXTERNAL_PORT).
+      - "127.0.0.1:${KAFKA_EXTERNAL_PORT:-9094}:9094"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks: [kafka-net]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+
+  # One-shot: tạo topic `orders` (3 partition, RF 1) rồi thoát. --if-not-exists nên chạy lại vẫn an toàn.
+  init:
+    image: *kafka-image
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [kafka-net]
+    command:
+      - /opt/kafka/bin/kafka-topics.sh
+      - --bootstrap-server
+      - kafka:9092
+      - --create
+      - --if-not-exists
+      - --topic
+      - orders
+      - --partitions
+      - "3"
+      - --replication-factor
+      - "1"
+    restart: "no"
+
+  # Ứng dụng Python: docker compose run --rm producer / consumer
+  producer:
+    profiles: [app]
+    build: ./app
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC: orders
+      MESSAGES: ${MESSAGES:-12}
+      MESSAGE_TIMEOUT_MS: ${MESSAGE_TIMEOUT_MS:-}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks: [kafka-net]
+    command: ["python", "producer.py"]
+
+  consumer:
+    profiles: [app]
+    build: ./app
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC: orders
+      GROUP_ID: ${GROUP_ID:-orders-consumer}
+      IDLE_EXIT_SECONDS: ${IDLE_EXIT_SECONDS:-0}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks: [kafka-net]
+    command: ["python", "consumer.py"]
+
+volumes:
+  kafka-data:
+
+networks:
+  kafka-net:
